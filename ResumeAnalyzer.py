@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-Robust Resume Scanner (PyQt5)
-
+AI Resume Scanner with PyQt5 — Dark Professional Dashboard
 Features:
-- PDF (.pdf) and Word (.docx) input
-- Normalization, fuzzy heading detection, regex extraction (email/phone/years/company/duration)
-- Fuzzy skill detection (typo-tolerant)
-- spaCy PhraseMatcher for section headings
-- PyQt5 GUI with large fonts, table (multiline), summary (short paragraphs) and suggested job title
-
-Install:
-pip install PyQt5 python-docx PyMuPDF spacy rapidfuzz
-python -m spacy download en_core_web_sm
+- Multi-threaded parsing for responsive UI
+- Extracts Name, Emails, Phones, Education, Experience, Skills, Specialization
+- Export results to CSV
+- Dark-themed, modern dashboard
 """
 
 import sys
@@ -20,120 +14,118 @@ import os
 from collections import defaultdict
 import docx
 import fitz  # PyMuPDF
-import math
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog,
-    QTableWidget, QTableWidgetItem, QLabel, QTextEdit, QHeaderView, QMessageBox
+    QTableWidget, QTableWidgetItem, QLabel, QTextEdit, QHeaderView, QMessageBox,
+    QProgressBar, QSizePolicy
 )
 from PyQt5.QtGui import QFont
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
-# NLP / fuzzy imports
 import spacy
 from spacy.matcher import PhraseMatcher
 from rapidfuzz import process, fuzz
 
 # ---------------------------
-# Load spaCy model (once)
+# Load spaCy
 # ---------------------------
 try:
     nlp = spacy.load("en_core_web_sm")
 except Exception as e:
-    raise SystemExit("spaCy model not found. Run: python -m spacy download en_core_web_sm") from e
+    raise SystemExit("Run: python -m spacy download en_core_web_sm") from e
 
 # ---------------------------
-# Constants and pools
+# Skill pools
 # ---------------------------
+SKILL_POOL = {
+    "Software & Programming": {
+        "score": 5, "keywords": ["python", "java", "c++", "c", "c#", "javascript", "sql", "git", "rest api", "ci/cd", "agile", "scrum", "jira"]
+    },
+    "Data Science & AI": {
+        "score": 10, "keywords": ["machine learning", "deep learning", "nlp", "tensorflow", "pytorch", "scikit-learn", "pandas", "numpy", "matplotlib", "seaborn", "r", "spark", "hadoop", "bi", "tableau", "power bi"]
+    },
+    "Electrical & Electronics Engineering": {
+        "score": 10, "keywords": ["verilog", "embedded c", "matlab", "xilinx vivado", "altium designer", "eagle", "pcb design", "circuit design", "vsim", "arduino", "raspberry pi", "microcontrollers", "vlsi", "fpga", "hfss", "ece"]
+    },
+    "Mechanical & Aerospace Engineering": {
+        "score": 8, "keywords": ["autocad", "solidworks", "ansys", "catia", "cad", "cam", "thermodynamics", "fluid mechanics", "materials science", "fea", "robotics", "3d printing", "propulsion", "aerodynamics"]
+    },
+    "Civil Engineering": {
+        "score": 8, "keywords": ["autocad civil 3d", "revit", "etabs", "staad pro", "safe", "gis", "structural analysis", "geotechnical engineering", "transportation engineering"]
+    },
+    "Web Development": {
+        "score": 5, "keywords": ["html", "css", "javascript", "react", "angular", "vue.js", "node.js", "django", "flask"]
+    },
+    "Project Management & Business": {
+        "score": 4, "keywords": ["project management", "scrum", "agile", "jira", "confluence", "microsoft office", "excel", "powerpoint", "finance", "marketing"]
+    }
+}
+
+FLATTENED_SKILL_POOL = [skill for sublist in [d['keywords'] for d in SKILL_POOL.values()] for skill in sublist]
+
+# ---------------------------
+# Regex patterns
+# ---------------------------
+RE_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
+RE_PHONE = re.compile(r"(?:\+?\d{1,3}[\s\-\.]?)?(?:\(?\d{2,4}\)?[\s\-\.]?)?\d{6,12}")
+RE_DATE_RANGE = re.compile(
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{4}\s*[\-–]\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{4}|(present|current|until now)", re.I)
+
 SECTION_KEYWORDS = {
     "experience": ["experience", "work experience", "employment history", "professional experience", "work history", "roles", "career"],
     "education": ["education", "academic", "academic background", "qualifications", "degrees", "education & qualifications"],
     "skills": ["skills", "technical skills", "key skills", "competencies", "expertise", "skillset"],
-    "projects": ["projects", "personal projects", "academic projects", "selected projects"],
+    "projects": ["projects", "personal projects", "academic projects", "selected projects", "research"],
     "certifications": ["certifications", "licenses"],
     "summary": ["summary", "profile", "professional summary", "about", "about me", "career objective"],
-    "interests": ["interests", "areas of interest", "hobbies"],
+    "awards": ["awards", "honors", "achievements"],
+    "publications": ["publications", "research papers"]
 }
-
-# flattened skill pool (extendable)
-SKILL_POOL = [
-    "python","sql","machine learning","deep learning","nlp","docker","git","tableau",
-    "pandas","numpy","tensorflow","pytorch","scikit-learn","keras","aws","spark",
-    "excel","power bi","c++","java","javascript","react","flask","fastapi","linux",
-    "nosql","mongodb","hadoop","matplotlib","seaborn","etl","rest api","aws s3","ci/cd",
-    "keras","spark","spark sql","statistics","r","sas","scala","kubernetes","tensorflow lite"
-]
-
-# regex patterns
-RE_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
-RE_PHONE = re.compile(r"(?:\+?\d{1,3}[\s\-\.]?)?(?:\(?\d{2,4}\)?[\s\-\.]?)?\d{6,12}")
-RE_YEAR = re.compile(r"\b(19|20)\d{2}\b")
-RE_COMPANY_DUR = re.compile(r"([A-Z][A-Za-z0-9&\.\- ,]{2,80}?)\s*\(\s*([A-Za-z0-9 ,\-\–\—\/]+)\s*\)")
-
-# PhraseMatcher for headings
 phrase_matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
 for sec, kws in SECTION_KEYWORDS.items():
     phrase_matcher.add(sec, [nlp.make_doc(k) for k in kws])
-
 
 # ---------------------------
 # Utility functions
 # ---------------------------
 def normalize_text(text: str) -> str:
-    """Lowercase, normalize whitespace, convert smart quotes, keep line breaks for section splitting."""
     if not text:
         return ""
-    # normalize unicode quotes and dashes
     text = text.replace("\u2013", "-").replace("\u2014", "-").replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
-    # unify newlines and spaces
     text = re.sub(r"\r\n?", "\n", text)
     text = re.sub(r"[ \t]+", " ", text)
-    # strip leading/trailing spaces for each line
     lines = [ln.strip() for ln in text.splitlines()]
     return "\n".join(lines).strip()
-
 
 def extract_text_from_docx(path: str) -> str:
     try:
         doc = docx.Document(path)
-        paragraphs = [p.text for p in doc.paragraphs]
-        return "\n".join(paragraphs)
+        return "\n".join([p.text for p in doc.paragraphs])
     except Exception:
-        # fallback to docx2txt if needed (not imported here to keep deps minimal)
         return ""
-
 
 def extract_text_from_pdf(path: str) -> str:
     try:
         doc = fitz.open(path)
-        pages = []
-        for page in doc:
-            pages.append(page.get_text("text") or "")
-        return "\n".join(pages)
+        return "\n".join([page.get_text("text") or "" for page in doc])
     except Exception:
         return ""
-
 
 def split_into_lines(text: str):
     return [ln for ln in text.splitlines() if ln.strip()]
 
-
 def fuzzy_section_heading(line: str, threshold=80):
-    """Return matched section key if line looks like a heading via fuzzy match / phrase matcher"""
     if not line:
         return None
-    doc = nlp(line)
-    # phrase matcher first (fast, exact phrase variants)
-    matches = phrase_matcher(doc)
+    doc_line = nlp(line)
+    matches = phrase_matcher(doc_line)
     if matches:
-        # return the label of first match
         match_id, start, end = matches[0]
         return nlp.vocab.strings[match_id]
-    # fuzzy against keywords
     best = None
     best_score = 0
     for sec, kws in SECTION_KEYWORDS.items():
-        # check each keyword phrase fuzzily
         for kw in kws:
             score = fuzz.token_set_ratio(line.lower(), kw.lower())
             if score > best_score:
@@ -143,213 +135,170 @@ def fuzzy_section_heading(line: str, threshold=80):
         return best
     return None
 
-
-def find_name(lines, email_candidate=None):
-    """Heuristic name extraction:
-       - line above email (if exists)
-       - any spaCy PERSON in top lines
-       - first plausible header line
-    """
-    # 1) email neighbor
-    if email_candidate:
-        for i, ln in enumerate(lines):
-            if email_candidate in ln:
-                if i > 0:
-                    cand = lines[i - 1].strip()
-                    if plausible_name(cand):
-                        return titlecase(cand)
-    # 2) spaCy PERSON in header
-    header = " ".join(lines[:12])
-    doc = nlp(header)
-    persons = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
-    if persons:
-        # prefer longer 2+ word names
-        for p in persons:
-            if len(p.split()) >= 2:
-                return titlecase(p)
-        return titlecase(persons[0])
-    # 3) first plausible line
-    for ln in lines[:6]:
-        if plausible_name(ln):
-            return titlecase(ln)
-    return "Not Found"
-
-
-def plausible_name(s: str) -> bool:
-    if not s: return False
-    s = s.strip()
-    if len(s) < 3 or len(s) > 50: return False
-    if re.search(r"(@|www\.|http|resume|curriculum|objective|linkedin|github)", s.lower()): return False
-    words = [w for w in s.split() if re.search(r"[A-Za-z]", w)]
-    return 1 < len(words) <= 4
-
-
-def titlecase(s: str) -> str:
-    return " ".join([w.capitalize() for w in re.sub(r"[^A-Za-z\s\-']", " ", s).split()])
-
-
-def extract_emails(text: str):
-    return list(dict.fromkeys(RE_EMAIL.findall(text)))  # unique preserve order
-
-
-def extract_phones(text: str):
-    raw = RE_PHONE.findall(text)
-    # cleanup and pick plausible ones
-    cleaned = []
-    for r in raw:
-        digits = re.sub(r"\D", "", r)
-        if 8 <= len(digits) <= 15:
-            cleaned.append(r.strip())
-    # dedupe
-    return list(dict.fromkeys(cleaned))
-
-
-def extract_years(text: str):
-    return list(dict.fromkeys(RE_YEAR.findall(text)))  # NOTE: findall returns tuples for groups, but okay for detection
-
-
-def extract_company_duration(text: str):
-    items = []
-    for m in RE_COMPANY_DUR.finditer(text):
-        comp = m.group(1).strip()
-        dur = m.group(2).strip()
-        items.append(f"{comp} ({dur})")
-    return items
-
-
-def fuzzy_find_skills(text: str, pool=SKILL_POOL, limit=20, threshold=80):
-    """Use rapidfuzz to find best skill matches from pool allowing typos."""
+def fuzzy_find_skills(text: str, pool=FLATTENED_SKILL_POOL, limit=30, threshold=80):
     found = set()
-    txt = text.lower()
-    # Try direct substring first (fast)
-    for s in pool:
-        if s.lower() in txt:
-            found.add(s)
-    # If not many found, fuzzy-extract tokens/phrases
-    if len(found) < 5:
-        # consider splitting text into phrases (by comma/pipe/semicolon and by newline)
-        candidates = set(re.split(r"[\n,;•\-–]+", text))
-        for cand in candidates:
-            cand = cand.strip()
-            if not cand or len(cand) < 3: continue
-            # find best match from pool
-            best = process.extractOne(cand, pool, scorer=fuzz.token_sort_ratio)
+    doc = nlp(text.lower())
+    skill_matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
+    skill_patterns = [nlp.make_doc(s) for s in pool]
+    skill_matcher.add("SKILLS", skill_patterns)
+    matches = skill_matcher(doc)
+    for match_id, start, end in matches:
+        found.add(doc[start:end].text)
+    if len(found) < 10:
+        tokens = [token.text for token in doc if not token.is_punct and not token.is_space and len(token) > 2]
+        for token in tokens:
+            best = process.extractOne(token, pool, scorer=fuzz.token_set_ratio)
             if best and best[1] >= threshold:
-                found.add(best[0])
-    # return sorted heuristically by pool order
-    ordered = [s for s in pool if s in found]
-    return ordered[:limit] if ordered else []
+                found.add(best[0].lower())
+    return sorted(list(found))[:limit]
 
-
-# ---------------------------
-# High-level extraction function
-# ---------------------------
-def parse_resume_text(raw_text: str):
-    """
-    Parses resume text robustly and returns a dict with fields:
-      Name, Email(s), Phone(s), Education (list), Experience (list), Skills (list),
-      Summary (multi-paragraph), Specialization (suggested job title)
-    """
-    text = normalize_text(raw_text)
-    lines = split_into_lines(text)
-
-    # Extract emails & phones
-    emails = extract_emails(raw_text)
-    phones = extract_phones(raw_text)
-
-    # Name detection
-    name = find_name(lines, emails[0] if emails else None)
-
-    # Section segmentation: find headings using fuzzy heading detection
-    sections = defaultdict(list)
-    current_section = "preamble"
-    for i, ln in enumerate(lines):
-        # if a heading-like short line, detect
-        heading = fuzzy_section_heading(ln)
-        if heading:
-            current_section = heading
-            continue
-        sections[current_section].append(ln)
-
-    # If sections empty, fall back to whole doc as preamble
-    # Convert section lists to text
-    section_text = {k: "\n".join(v).strip() for k, v in sections.items()}
-
-    # Education extraction: look for degree keywords within education section first, then globally
-    edu_lines = []
-    if section_text.get("education"):
-        edu_lines = [ln for ln in section_text["education"].splitlines() if len(ln) > 3]
-    else:
-        for ln in lines:
-            if any(d.lower() in ln.lower() for d in ["b.tech","b.e","m.tech","m.e","bachelor","master","msc","bsc","phd","mba","degree","university","college","institute"]):
-                edu_lines.append(ln)
-    # dedupe & shorten
-    education = list(dict.fromkeys(edu_lines))[:8]
-
-    # Experience extraction: from experience section OR search for role-like lines / durations
-    exp_lines = []
-    if section_text.get("experience"):
-        exp_lines = [ln for ln in section_text["experience"].splitlines() if len(ln) > 3]
-    else:
-        # heuristics: lines with 'intern', 'engineer', 'developer', 'worked', 'project' or containing years/date ranges
-        for ln in lines:
-            lnl = ln.lower()
-            if any(k in lnl for k in ["intern", "engineer", "developer", "consultant", "analyst", "manager", "worked", "project", "research"]):
-                exp_lines.append(ln)
-            elif re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b|\d{4}", ln, re.I):
-                # likely date mention, include nearby line
-                exp_lines.append(ln)
-    # also try to extract company(duration) patterns
-    company_durs = extract_company_duration(raw_text)
-    for cd in company_durs:
-        if cd not in exp_lines:
-            exp_lines.insert(0, cd)
-    experience = list(dict.fromkeys(exp_lines))[:12]
-
-    # Skills: try skills section first, then fuzzy in whole doc
-    skills = []
-    if section_text.get("skills"):
-        skills = fuzzy_find_skills(section_text["skills"], SKILL_POOL, threshold=70)
-    if not skills:
-        skills = fuzzy_find_skills(raw_text, SKILL_POOL, threshold=78)
-
-    # Specialization: determine job title suggestion from skills
-    specialization = "Software Engineer / IT Professional"
-    skset = set([s.lower() for s in skills])
-    if any(k in skset for k in ["machine learning", "deep learning", "nlp", "tensorflow", "pytorch"]):
-        specialization = "Machine Learning Engineer / Data Scientist"
-    elif any(k in skset for k in ["sql", "tableau", "power bi", "excel", "bi"]):
-        specialization = "Data Analyst / BI Engineer"
-    elif any(k in skset for k in ["docker", "kubernetes", "ci/cd", "aws", "devops", "kubectl"]):
-        specialization = "MLOps / DevOps Engineer"
-    elif any(k in skset for k in ["react","javascript","flask","fastapi","django","api"]):
-        specialization = "Full-stack / Backend Engineer"
-
-    # Build short paragraph-style summary with insights
-    summary_parts = []
-    if name and name != "Not Found":
-        summary_parts.append(f"{name} is a candidate with the following detected background.")
-    if education:
-        summary_parts.append(f"Education highlights include: {education[0] + (', ...' if len(education) > 1 else '')}.")
-    if experience:
-        summary_parts.append(f"Experience snippets: {experience[0] + (', ...' if len(experience) > 1 else '')}.")
-    if skills:
-        summary_parts.append(f"Key skills detected: {', '.join(skills[:6])}.")
-    summary_parts.append(f"Suggested role: {specialization}.")
-
-    summary = "\n\n".join(summary_parts)
-
-    return {
-        "Name": name,
-        "Emails": emails if emails else ["Not Found"],
-        "Phones": phones if phones else ["Not Found"],
-        "Education": education if education else ["Not Found"],
-        "Experience": experience if experience else ["Not Found"],
-        "Skills": skills if skills else ["Not Found"],
-        "Specialization": specialization,
-        "Summary": summary
+def get_specialization(skills, education_lines, experience_lines):
+    skill_set = set(skills)
+    scores = defaultdict(int)
+    for category, data in SKILL_POOL.items():
+        for keyword in data['keywords']:
+            if keyword in skill_set:
+                scores[category] += data['score']
+    education_text = " ".join(education_lines).lower()
+    experience_text = " ".join(experience_lines).lower()
+    if any(s in education_text for s in ["computer science", "cs", "software"]):
+        scores["Software & Programming"] += 15
+    if any(s in education_text for s in ["electronics", "ece"]):
+        scores["Electrical & Electronics Engineering"] += 15
+    if any(s in education_text for s in ["mechanical", "aerospace"]):
+        scores["Mechanical & Aerospace Engineering"] += 15
+    if any(s in education_text for s in ["civil engineering", "civil"]):
+        scores["Civil Engineering"] += 15
+    if any(s in experience_text for s in ["data scientist", "machine learning"]):
+        scores["Data Science & AI"] += 15
+    if any(s in experience_text for s in ["web developer", "full-stack"]):
+        scores["Web Development"] += 10
+    total_score = sum(scores.values())
+    if not total_score:
+        return "General Professional", {}
+    weighted_scores = {k: (v / total_score) * 100 for k, v in scores.items()}
+    best_category = max(weighted_scores, key=weighted_scores.get)
+    mapping = {
+        "Software & Programming": "Software Engineer / Developer",
+        "Data Science & AI": "Machine Learning Engineer / Data Scientist",
+        "Electrical & Electronics Engineering": "Electronics Engineer / ECE Professional",
+        "Mechanical & Aerospace Engineering": "Mechanical Engineer",
+        "Civil Engineering": "Civil Engineer",
+        "Web Development": "Web Developer",
+        "Project Management & Business": "Project Management / Business Analyst"
     }
+    return mapping.get(best_category, "General Professional"), weighted_scores
 
+# ---------------------------
+# Parser Worker
+# ---------------------------
+class ParserWorker(QThread):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    def run(self):
+        try:
+            parsed = self.parse_resume_text(self.text)
+            self.finished.emit(parsed)
+        except Exception as e:
+            self.error.emit(f"Parsing failed: {e}")
+
+    def parse_resume_text(self, raw_text: str):
+        text = normalize_text(raw_text)
+        lines = split_into_lines(text)
+
+        # Improved Name Extraction
+        def extract_name(lines):
+            for ln in lines[:15]:
+                ln = ln.strip()
+                # Title case
+                match = re.match(r"^([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)$", ln)
+                if match:
+                    return match.group(1).strip()
+                # All caps
+                if ln.isupper() and len(ln.split()) >= 2 and all(w.isalpha() for w in ln.split()):
+                    return ln.title()
+            for ln in lines[:20]:
+                if "name" in ln.lower():
+                    parts = ln.split(":")
+                    if len(parts) > 1:
+                        return parts[1].strip().title()
+            return "Not Found"
+
+        def extract_emails(text):
+            return re.findall(RE_EMAIL, text) or ["Not Found"]
+
+        def extract_phones(text):
+            phone_pattern = r"(\+?\d{1,3}[-\s]?)?\(?\d{2,4}\)?[-\s]?\d{3,4}[-\s]?\d{4}"
+            matches = re.findall(phone_pattern, text)
+            results = []
+            for m in matches:
+                num = "".join(m) if isinstance(m, tuple) else m
+                digits = re.sub(r"\D", "", num)
+                if 8 <= len(digits) <= 15:
+                    results.append(num.strip())
+            return list(dict.fromkeys(results)) or ["Not Found"]
+
+        name = extract_name(lines)
+        emails = extract_emails(raw_text)
+        phones = extract_phones(raw_text)
+
+        # Sections
+        sections = defaultdict(list)
+        current_section = "preamble"
+        for ln in lines:
+            heading = fuzzy_section_heading(ln)
+            if heading:
+                current_section = heading
+                continue
+            sections[current_section].append(ln)
+        section_text = {k: "\n".join(v).strip() for k, v in sections.items()}
+
+        edu_lines = [ln for ln in section_text.get("education", "").splitlines() if len(ln) > 3]
+        if not edu_lines:
+            for ln in lines:
+                if any(d.lower() in ln.lower() for d in ["bachelor", "master", "phd", "degree", "university", "college", "institute", "school"]):
+                    edu_lines.append(ln)
+        education = list(dict.fromkeys(edu_lines))[:8]
+
+        experience_lines = [ln for ln in section_text.get("experience", "").splitlines() if len(ln) > 3]
+        if not experience_lines:
+            for ln in lines:
+                if any(k in ln.lower() for k in ["engineer", "developer", "analyst", "intern", "project", "worked"]) or re.search(RE_DATE_RANGE, ln):
+                    experience_lines.append(ln)
+        experience = list(dict.fromkeys(experience_lines))[:15]
+
+        skills = fuzzy_find_skills(raw_text, FLATTENED_SKILL_POOL, threshold=78)
+        specialization, scores = get_specialization(skills, education, experience)
+
+        summary_parts = []
+        if name != "Not Found":
+            summary_parts.append(f"A profile for {name} has been successfully parsed. The system uses an advanced NLP pipeline.")
+        if education:
+            summary_parts.append(f"Education highlights include: {education[0] + (', ...' if len(education) > 1 else '')}.")
+        if experience:
+            summary_parts.append(f"The experience section details roles such as '{experience[0].split('(')[0].strip()}' and mentions key projects.")
+        if skills:
+            summary_parts.append(f"The candidate's core skills are in **{specialization}**, with a strong command of: {', '.join(skills[:6]) + '...' if len(skills)>6 else ''}.")
+        summary_parts.append(f"Overall, the resume suggests a strong fit for a **{specialization}** role.")
+
+        summary = "\n\n".join(summary_parts)
+
+        return {
+            "Name": name,
+            "Emails": emails,
+            "Phones": phones,
+            "Education": education,
+            "Experience": experience,
+            "Skills": skills,
+            "Specialization": specialization,
+            "SpecializationScores": scores,
+            "Summary": summary
+        }
 
 # ---------------------------
 # PyQt5 GUI
@@ -357,140 +306,138 @@ def parse_resume_text(raw_text: str):
 class ResumeApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Resume Analyzer — Robust")
-        self.setGeometry(160, 120, 1100, 760)
+        self.setWindowTitle("AI Resume Scanner — Professional Dashboard")
+        self.setGeometry(100, 100, 1000, 700)
+        self.setStyleSheet("background-color: #2c3e50; color: #ecf0f1;")
 
-        font_large = QFont("Segoe UI", 12)
-        self.setFont(font_large)
+        self.initUI()
+        self.current_resume_text = ""
 
+    def initUI(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(10,10,10,10)
 
-        header_row = QHBoxLayout()
-        self.btn_upload = QPushButton("Upload Resume (PDF / DOCX / TXT / Image)")
-        self.btn_upload.setFont(QFont("Segoe UI", 12))
-        self.btn_upload.clicked.connect(self.upload_resume)
-        header_row.addWidget(self.btn_upload)
+        # Header
+        header_layout = QHBoxLayout()
+        self.upload_btn = QPushButton("Upload Resume")
+        self.upload_btn.setStyleSheet("background-color: #3498db; color: #ecf0f1; font-weight:bold; font-size:16px; padding:8px;")
+        self.upload_btn.clicked.connect(self.upload_resume)
 
-        self.btn_export = QPushButton("Export CSV")
-        self.btn_export.setFont(QFont("Segoe UI", 11))
-        self.btn_export.clicked.connect(self.export_csv)
-        header_row.addWidget(self.btn_export)
+        self.export_btn = QPushButton("Export to CSV")
+        self.export_btn.setStyleSheet("background-color: #1abc9c; color: #2c3e50; font-weight:bold; font-size:16px; padding:8px;")
+        self.export_btn.clicked.connect(self.export_csv)
 
-        layout.addLayout(header_row)
+        header_layout.addWidget(self.upload_btn)
+        header_layout.addWidget(self.export_btn)
+        header_layout.addStretch()
 
-        # Table for extracted fields
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Field", "Details"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.table.setWordWrap(True)
-        self.table.setFont(QFont("Segoe UI", 11))
-        layout.addWidget(self.table, stretch=2)
+        # Progress Bar
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #34495e;
+                border-radius: 5px;
+                text-align: center;
+                height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #3498db;
+            }
+        """)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(2)
+        self.table.setHorizontalHeaderLabels(["Field", "Value"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setStyleSheet("background-color: #34495e; color: #ecf0f1; font-size:14px;")
+        self.table.verticalHeader().setVisible(False)
 
         # Summary
-        layout.addWidget(QLabel("Summary & Insights:"))
-        self.summary_box = QTextEdit()
-        self.summary_box.setReadOnly(True)
-        self.summary_box.setFont(QFont("Segoe UI", 12))
-        self.summary_box.setMinimumHeight(180)
-        layout.addWidget(self.summary_box, stretch=1)
+        self.summary_label = QLabel("AI Insights & Summary")
+        self.summary_label.setFont(QFont("Arial", 14, QFont.Bold))
+        self.summary_text = QTextEdit()
+        self.summary_text.setReadOnly(True)
+        self.summary_text.setStyleSheet("background-color: #34495e; color: #ecf0f1; font-size:14px;")
+
+        layout.addLayout(header_layout)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.table)
+        layout.addWidget(self.summary_label)
+        layout.addWidget(self.summary_text)
 
         self.setLayout(layout)
 
-        # state
-        self.last_parsed = None
-
     def upload_resume(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open Resume", "", "All Files (*);;PDF (*.pdf);;Word (*.docx);;Text (*.txt)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select Resume", "", "PDF Files (*.pdf);;Word Files (*.docx);;Text Files (*.txt)")
         if not path:
             return
-        # extract text robustly
-        text = ""
+
         ext = os.path.splitext(path)[1].lower()
-        try:
-            if ext == ".pdf":
-                text = extract_text_from_pdf(path)
-            elif ext == ".docx":
-                text = extract_text_from_docx(path)
-            elif ext == ".txt":
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    text = f.read()
-            else:
-                # try pdf/docx anyway
-                text = extract_text_from_pdf(path) or extract_text_from_docx(path)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to read file: {e}")
+        if ext == ".pdf":
+            self.current_resume_text = extract_text_from_pdf(path)
+        elif ext == ".docx":
+            self.current_resume_text = extract_text_from_docx(path)
+        else:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                self.current_resume_text = f.read()
+
+        if not self.current_resume_text.strip():
+            QMessageBox.warning(self, "Error", "Could not extract text from resume.")
             return
 
-        if not text.strip():
-            QMessageBox.warning(self, "No text", "Could not extract text from this file.")
-            return
+        self.progress.setVisible(True)
+        self.progress.setRange(0,0)  # Busy indicator
 
-        # parse
-        parsed = parse_resume_text(text)
-        self.last_parsed = parsed
-        self.populate_table(parsed)
-        self.summary_box.setPlainText(parsed["Summary"])
+        self.worker = ParserWorker(self.current_resume_text)
+        self.worker.finished.connect(self.display_result)
+        self.worker.error.connect(self.show_error)
+        self.worker.start()
 
-    def populate_table(self, parsed: dict):
-        # fields to display (ordered)
-        rows = [
-            ("Name", parsed.get("Name", "")),
-            ("Emails", ", ".join(parsed.get("Emails", []))),
-            ("Phones", ", ".join(parsed.get("Phones", []))),
-            ("Education", "\n".join(parsed.get("Education", []))),
-            ("Experience", "\n".join(parsed.get("Experience", []))),
-            ("Skills", ", ".join(parsed.get("Skills", []))),
-            ("Specialization", parsed.get("Specialization", "")),
-        ]
-        self.table.setRowCount(len(rows))
-        for r, (k, v) in enumerate(rows):
-            key_item = QTableWidgetItem(k)
-            key_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-            val_item = QTableWidgetItem(v)
-            val_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-            val_item.setTextAlignment(Qt.AlignLeft | Qt.AlignTop)
-            val_item.setToolTip(v)
-            self.table.setItem(r, 0, key_item)
-            self.table.setItem(r, 1, val_item)
-        # Force resize rows to fit content
-        self.table.resizeRowsToContents()
+    def display_result(self, result):
+        self.progress.setVisible(False)
+        self.table.setRowCount(0)
+
+        for field, value in result.items():
+            if isinstance(value, list):
+                value = ", ".join(value)
+            elif isinstance(value, dict):
+                value = ", ".join([f"{k}:{v:.1f}%" for k,v in value.items()])
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(field))
+            self.table.setItem(row, 1, QTableWidgetItem(str(value)))
+
+        self.summary_text.setPlainText(result.get("Summary", ""))
+
+    def show_error(self, msg):
+        self.progress.setVisible(False)
+        QMessageBox.critical(self, "Error", msg)
 
     def export_csv(self):
-        if not self.last_parsed:
-            QMessageBox.information(self, "No data", "Parse a resume first.")
+        if self.table.rowCount() == 0:
+            QMessageBox.warning(self, "Warning", "No data to export")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Save CSV", "", "CSV Files (*.csv)")
         if not path:
             return
-        try:
-            import csv
-            p = self.last_parsed
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["Field","Value"])
-                w.writerow(["Name", p.get("Name","")])
-                w.writerow(["Emails", "; ".join(p.get("Emails",[]))])
-                w.writerow(["Phones", "; ".join(p.get("Phones",[]))])
-                w.writerow(["Education", " | ".join(p.get("Education",[]))])
-                w.writerow(["Experience", " | ".join(p.get("Experience",[]))])
-                w.writerow(["Skills", " | ".join(p.get("Skills",[]))])
-                w.writerow(["Specialization", p.get("Specialization","")])
-            QMessageBox.information(self, "Saved", "CSV exported.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save CSV: {e}")
-
+        import csv
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Field", "Value"])
+            for r in range(self.table.rowCount()):
+                field = self.table.item(r,0).text()
+                value = self.table.item(r,1).text()
+                writer.writerow([field,value])
+        QMessageBox.information(self, "Success", f"Data exported to {path}")
 
 # ---------------------------
-# Run app
+# Run App
 # ---------------------------
-def main():
-    app = QApplication(sys.argv)
-    win = ResumeApp()
-    win.show()
-    sys.exit(app.exec_())
-
-
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+    window = ResumeApp()
+    window.show()
+    sys.exit(app.exec_())
