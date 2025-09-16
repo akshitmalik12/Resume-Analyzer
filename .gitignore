@@ -1,8 +1,24 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.swp
-*.DS_Store
+*.py[cod]
+*$py.class
+
+# Virtual environments
 venv/
-.env
+myenv/
+.env/
+
+# macOS
+.DS_Store
+
+# VSCode
+.vscode/
+
+# PyCharm
+.idea/
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
